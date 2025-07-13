@@ -1,0 +1,281 @@
+# GitLab CI/CD Pipeline for MinIO and Longhorn Integration
+# This pipeline implements best practices for deployment, testing, and security
+
+variables:
+  # Docker Registry Configuration
+  REGISTRY: $CI_REGISTRY
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  
+  # MinIO Configuration
+  MINIO_ROOT_USER: $MINIO_ROOT_USER
+  MINIO_ROOT_PASSWORD: $MINIO_ROOT_PASSWORD
+  MINIO_ENDPOINT: $MINIO_ENDPOINT
+  
+  # Longhorn Configuration
+  LONGHORN_NAMESPACE: longhorn-system
+  
+  # Security and Compliance
+  TRIVY_VERSION: "0.48.3"
+  HELM_VERSION: "3.13.3"
+  KUBECTL_VERSION: "1.28.4"
+
+stages:
+  - validate
+  - build
+  - security-scan
+  - test
+  - deploy-staging
+  - integration-test
+  - deploy-production
+  - cleanup
+
+# Include templates for common functions
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+# Validate YAML and configurations
+validate:
+  stage: validate
+  image: alpine:3.18
+  before_script:
+    - apk add --no-cache yamllint
+  script:
+    - yamllint .gitlab-ci.yml
+    - yamllint k8s/
+    - yamllint helm/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Validate Kubernetes manifests
+validate-k8s:
+  stage: validate
+  image: alpine/k8s:1.28.4
+  script:
+    - kubectl --dry-run=client apply -f k8s/
+    - kubectl --dry-run=server apply -f k8s/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Validate Helm charts
+validate-helm:
+  stage: validate
+  image: alpine/helm:$HELM_VERSION
+  script:
+    - helm lint helm/minio/
+    - helm lint helm/longhorn/
+    - helm template minio helm/minio/ --debug
+    - helm template longhorn helm/longhorn/ --debug
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Build Docker images for MinIO clients/tools
+build-minio-client:
+  stage: build
+  image: docker:24.0.7
+  services:
+    - docker:24.0.7-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $IMAGE_NAME/minio-client:$CI_COMMIT_SHA -f docker/minio-client/Dockerfile .
+    - docker push $IMAGE_NAME/minio-client:$CI_COMMIT_SHA
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]; then
+        docker tag $IMAGE_NAME/minio-client:$CI_COMMIT_SHA $IMAGE_NAME/minio-client:latest
+        docker push $IMAGE_NAME/minio-client:latest
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Security scanning with Trivy
+security-scan-images:
+  stage: security-scan
+  image: aquasec/trivy:$TRIVY_VERSION
+  variables:
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+  cache:
+    paths:
+      - .trivycache/
+  script:
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format template --template "@contrib/sarif.tpl" -o gl-container-scanning-report.json $IMAGE_NAME/minio-client:$CI_COMMIT_SHA
+    - trivy image --exit-code 1 --severity CRITICAL $IMAGE_NAME/minio-client:$CI_COMMIT_SHA
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+    expire_in: 1 week
+  dependencies:
+    - build-minio-client
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Test MinIO connectivity and operations
+test-minio-connectivity:
+  stage: test
+  image: minio/mc:latest
+  variables:
+    MC_HOST_minio: "http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@${MINIO_ENDPOINT}"
+  script:
+    - mc alias set minio $MINIO_ENDPOINT $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+    - mc admin info minio
+    - mc mb minio/test-bucket --ignore-existing
+    - echo "test content" | mc pipe minio/test-bucket/test-file.txt
+    - mc cat minio/test-bucket/test-file.txt
+    - mc rm minio/test-bucket/test-file.txt
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  allow_failure: true
+
+# Test Longhorn storage
+test-longhorn-storage:
+  stage: test
+  image: bitnami/kubectl:$KUBECTL_VERSION
+  script:
+    - kubectl get nodes
+    - kubectl get storageclass
+    - kubectl get volumesnapshotclass
+    - kubectl -n $LONGHORN_NAMESPACE get pods
+    - kubectl -n $LONGHORN_NAMESPACE get daemonset
+    - kubectl apply -f tests/longhorn-test-pvc.yaml
+    - kubectl wait --for=condition=Bound pvc/longhorn-test-pvc --timeout=300s
+    - kubectl delete pvc longhorn-test-pvc
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  allow_failure: true
+
+# Deploy to staging environment
+deploy-staging:
+  stage: deploy-staging
+  image: alpine/helm:$HELM_VERSION
+  environment:
+    name: staging
+    url: https://minio-staging.example.com
+  before_script:
+    - apk add --no-cache kubectl
+  script:
+    - kubectl config use-context $KUBE_CONTEXT_STAGING
+    - helm upgrade --install minio-staging helm/minio/ 
+        --namespace minio-staging 
+        --create-namespace
+        --values helm/minio/values-staging.yaml
+        --set image.tag=$CI_COMMIT_SHA
+        --wait --timeout=600s
+    - helm upgrade --install longhorn-staging helm/longhorn/
+        --namespace longhorn-staging
+        --create-namespace
+        --values helm/longhorn/values-staging.yaml
+        --wait --timeout=600s
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  dependencies:
+    - build-minio-client
+
+# Integration tests in staging
+integration-test-staging:
+  stage: integration-test
+  image: $IMAGE_NAME/minio-client:$CI_COMMIT_SHA
+  environment:
+    name: staging
+  variables:
+    MINIO_ENDPOINT: "https://minio-staging.example.com"
+  script:
+    - ./scripts/integration-tests.sh staging
+  artifacts:
+    reports:
+      junit: test-results.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  dependencies:
+    - deploy-staging
+
+# Deploy to production (manual approval required)
+deploy-production:
+  stage: deploy-production
+  image: alpine/helm:$HELM_VERSION
+  environment:
+    name: production
+    url: https://minio.example.com
+  before_script:
+    - apk add --no-cache kubectl
+  script:
+    - kubectl config use-context $KUBE_CONTEXT_PRODUCTION
+    - helm upgrade --install minio-prod helm/minio/
+        --namespace minio-production
+        --create-namespace
+        --values helm/minio/values-production.yaml
+        --set image.tag=$CI_COMMIT_SHA
+        --wait --timeout=600s
+    - helm upgrade --install longhorn-prod helm/longhorn/
+        --namespace longhorn-production
+        --create-namespace
+        --values helm/longhorn/values-production.yaml
+        --wait --timeout=600s
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+  dependencies:
+    - integration-test-staging
+
+# Backup production data
+backup-production:
+  stage: deploy-production
+  image: minio/mc:latest
+  environment:
+    name: production
+  variables:
+    MC_HOST_prod: "http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@${MINIO_ENDPOINT}"
+    MC_HOST_backup: "http://${BACKUP_ACCESS_KEY}:${BACKUP_SECRET_KEY}@${BACKUP_ENDPOINT}"
+  script:
+    - mc alias set prod $MINIO_ENDPOINT $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+    - mc alias set backup $BACKUP_ENDPOINT $BACKUP_ACCESS_KEY $BACKUP_SECRET_KEY
+    - mc mirror prod/ backup/backups/$(date +%Y-%m-%d)/
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  allow_failure: true
+
+# Cleanup old images and artifacts
+cleanup:
+  stage: cleanup
+  image: alpine:3.18
+  script:
+    - echo "Cleaning up old artifacts and images"
+    - echo "This would typically call registry cleanup APIs"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  when: manual
+  allow_failure: true
+
+# Notification on pipeline completion
+notify-completion:
+  stage: .post
+  image: alpine:3.18
+  script:
+    - apk add --no-cache curl
+    - |
+      if [ "$CI_JOB_STATUS" == "success" ]; then
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"✅ Pipeline succeeded for '"$CI_PROJECT_NAME"' on '"$CI_COMMIT_BRANCH"'"}' \
+          $SLACK_WEBHOOK_URL
+      else
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"❌ Pipeline failed for '"$CI_PROJECT_NAME"' on '"$CI_COMMIT_BRANCH"'"}' \
+          $SLACK_WEBHOOK_URL
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  when: always
+  allow_failure: true

@@ -1,0 +1,22 @@
+apiVersion: v2
+name: minio
+description: A Helm chart for MinIO Object Storage
+type: application
+version: 0.1.0
+appVersion: "RELEASE.2024-01-16T16-07-38Z"
+keywords:
+  - storage
+  - object-storage
+  - minio
+home: https://min.io
+sources:
+  - https://github.com/minio/minio
+maintainers:
+  - name: CoreNet Team
+    email: corenet@example.com
+dependencies:
+  - name: common
+    repository: https://charts.bitnami.com/bitnami
+    tags:
+      - bitnami-common
+    version: 2.x.x

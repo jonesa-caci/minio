@@ -1,0 +1,110 @@
+# Production environment values for MinIO
+replicaCount: 3
+
+image:
+  tag: "RELEASE.2024-01-16T16-07-38Z"
+
+minio:
+  rootUser: "minio-admin"
+  rootPassword: "very-secure-production-password-456"
+  domain: "minio.example.com"
+  serverUrl: "https://minio.example.com"
+  browserRedirectUrl: "https://console.minio.example.com"
+
+ingress:
+  hosts:
+    - host: minio.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          port: 9000
+  console:
+    hosts:
+      - host: console.minio.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+            port: 9001
+  tls:
+    - secretName: minio-production-tls
+      hosts:
+        - minio.example.com
+        - console.minio.example.com
+
+persistence:
+  size: 500Gi
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+
+# Production-specific security settings
+podSecurityContext:
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Network policy for production
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: ingress-nginx
+      - namespaceSelector:
+          matchLabels:
+            name: monitoring
+      ports:
+      - protocol: TCP
+        port: 9000
+      - protocol: TCP
+        port: 9001
+  egress:
+    - to: []
+      ports:
+      - protocol: TCP
+        port: 53
+      - protocol: UDP
+        port: 53
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: longhorn-system
+      ports:
+      - protocol: TCP
+        port: 443

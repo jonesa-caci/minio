@@ -1,0 +1,49 @@
+# Staging environment values for MinIO
+replicaCount: 1
+
+image:
+  tag: "RELEASE.2024-01-16T16-07-38Z"
+
+minio:
+  rootUser: "minio-staging"
+  rootPassword: "staging-password-123"
+  domain: "minio-staging.example.com"
+  serverUrl: "https://minio-staging.example.com"
+  browserRedirectUrl: "https://console-staging.minio.example.com"
+
+ingress:
+  hosts:
+    - host: minio-staging.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          port: 9000
+  console:
+    hosts:
+      - host: console-staging.minio.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+            port: 9001
+  tls:
+    - secretName: minio-staging-tls
+      hosts:
+        - minio-staging.example.com
+        - console-staging.minio.example.com
+
+persistence:
+  size: 50Gi
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 60s
